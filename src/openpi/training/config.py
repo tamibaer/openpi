@@ -283,6 +283,10 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 class LeRobotUR5eDataConfig(DataConfigFactory):
     """UR5e + Robotiq, Datensatz aus examples/ur5e/rosbag_to_lerobot.py."""
 
+    # True: Modell arbeitet mit Gelenk-Deltas (relativ zum Zustand), Greifer absolut.
+    # False: Modell gibt absolute Gelenkwinkel aus (nur für Zero-Shot-Tests mit Basismodellen nötig).
+    delta_actions: bool = True
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # Datensatz-Spalten -> Schlüssel, die auch der Roboter-Client bei der Inference schickt.
@@ -308,11 +312,12 @@ class LeRobotUR5eDataConfig(DataConfigFactory):
         )
 
         # Absolute Gelenkziele -> Deltas (relativ zum aktuellen Zustand). Greifer (7.) bleibt absolut.
-        delta_action_mask = _transforms.make_bool_mask(6, -1)
-        data_transforms = data_transforms.push(
-            inputs=[_transforms.DeltaActions(delta_action_mask)],
-            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-        )
+        if self.delta_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
 
         model_transforms = ModelTransformFactory()(model_config)
 
@@ -600,6 +605,30 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+
+
+def _ur5e_zeroshot(name: str, base: str, *, delta: bool) -> "TrainConfig":
+    """Basismodell OHNE Fine-Tuning auf dem UR5e laufen lassen (nur serve_policy, kein Training).
+
+    Nutzt die UR5e-Normstats aus dem Vortraining (asset_id "ur5e" im Basis-Checkpoint).
+    base: "pi0_base" oder "pi0_fast_base".
+    """
+    if base == "pi0_fast_base":
+        model = pi0_fast.Pi0FASTConfig()  # Originalformat des Vortrainings: 32 Dimensionen, 32 Schritte
+    else:
+        model = pi0_config.Pi0Config()
+    return TrainConfig(
+        name=name,
+        model=model,
+        data=LeRobotUR5eDataConfig(
+            repo_id="local/ur5e_blocks",
+            assets=AssetsConfig(assets_dir=f"gs://openpi-assets/checkpoints/{base}/assets", asset_id="ur5e"),
+            base_config=DataConfig(prompt_from_task=True),
+            delta_actions=delta,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"gs://openpi-assets/checkpoints/{base}/params"),
+        wandb_enabled=False,
+    )
 
 
 def _pi0_fast_ur5e(name: str, repo_id: str, *, lora: bool = False) -> "TrainConfig":
@@ -1075,6 +1104,11 @@ _CONFIGS = [
     _pi0_fast_ur5e("pi0_fast_ur5e_narrow", "local/ur5e_blocks_narrow"),
     _pi0_fast_ur5e("pi0_fast_ur5e_diverse", "local/ur5e_blocks_diverse"),
     _pi0_fast_ur5e("pi0_fast_ur5e_narrow_lora", "local/ur5e_blocks_narrow", lora=True),
+    # Zero-Shot: Basismodelle ohne Fine-Tuning (UR5e war im Vortraining). Delta- und Absolut-Variante.
+    _ur5e_zeroshot("pi0_ur5e_zeroshot", "pi0_base", delta=True),
+    _ur5e_zeroshot("pi0_ur5e_zeroshot_abs", "pi0_base", delta=False),
+    _ur5e_zeroshot("pi0_fast_ur5e_zeroshot", "pi0_fast_base", delta=True),
+    _ur5e_zeroshot("pi0_fast_ur5e_zeroshot_abs", "pi0_fast_base", delta=False),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
