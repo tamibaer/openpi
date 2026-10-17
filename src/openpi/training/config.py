@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.ur5e_policy as ur5e_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -275,6 +276,51 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotUR5eDataConfig(DataConfigFactory):
+    """UR5e + Robotiq, Datensatz aus examples/ur5e/rosbag_to_lerobot.py."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Datensatz-Spalten -> Schlüssel, die auch der Roboter-Client bei der Inference schickt.
+        # Achtung: RepackTransform behält NUR die hier aufgeführten Schlüssel.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "base_rgb": "image",
+                        "wrist_rgb": "wrist_image",
+                        "joints": "joints",
+                        "gripper": "gripper",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[ur5e_policy.UR5eInputs(model_type=model_config.model_type)],
+            outputs=[ur5e_policy.UR5eOutputs()],
+        )
+
+        # Absolute Gelenkziele -> Deltas (relativ zum aktuellen Zustand). Greifer (7.) bleibt absolut.
+        delta_action_mask = _transforms.make_bool_mask(6, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
         )
 
 
@@ -554,6 +600,30 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+
+
+def _pi0_fast_ur5e(name: str, repo_id: str, *, lora: bool = False) -> "TrainConfig":
+    """pi0-FAST auf UR5e-Daten. Alle Bedingungen teilen sich exakt dieselben Hyperparameter,
+    damit sich Läufe nur in Datensatz (Sprachvielfalt) und Freeze-Strategie unterscheiden.
+
+    lora=False: volles Fine-Tuning – Token-Embeddings werden mittrainiert (wie im Paper analysiert).
+    lora=True:  LoRA – das Sprachmodell inkl. Embeddings (llm/embedder) bleibt eingefroren.
+    """
+    variant = "gemma_2b_lora" if lora else "gemma_2b"
+    model = pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant=variant)
+    return TrainConfig(
+        name=name,
+        model=model,
+        data=LeRobotUR5eDataConfig(repo_id=repo_id, base_config=DataConfig(prompt_from_task=True)),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=10_000,
+        batch_size=32,
+        save_interval=2_000,
+        keep_period=2_000,
+        seed=42,
+        freeze_filter=model.get_freeze_filter() if lora else nnx.Nothing(),
+        ema_decay=None if lora else 0.99,
+    )
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -965,6 +1035,46 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+    #
+    # UR5e + Robotiq (eigene Daten, examples/ur5e/rosbag_to_lerobot.py)
+    #
+    TrainConfig(
+        # Rauchtest lokal (z. B. RTX 5080): winziges Dummy-Modell, keine vortrainierten Gewichte.
+        # Prüft nur, ob Datensatz -> Transforms -> Training durchläuft und der Loss sinkt.
+        name="ur5e_debug",
+        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        data=LeRobotUR5eDataConfig(
+            repo_id="local/ur5e_blocks",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=4,
+        num_train_steps=500,
+        log_interval=25,
+        save_interval=500,
+        num_workers=2,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        # Echtes Fine-Tuning (Cloud-GPU mit >= 24 GB): pi0.5 Base + LoRA.
+        name="pi05_ur5e_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ),
+        data=LeRobotUR5eDataConfig(
+            repo_id="local/ur5e_blocks",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # Paper-Experiment: gleiche Demos, unterschiedliche Sprachvielfalt bzw. Freeze-Strategie.
+    _pi0_fast_ur5e("pi0_fast_ur5e_narrow", "local/ur5e_blocks_narrow"),
+    _pi0_fast_ur5e("pi0_fast_ur5e_diverse", "local/ur5e_blocks_diverse"),
+    _pi0_fast_ur5e("pi0_fast_ur5e_narrow_lora", "local/ur5e_blocks_narrow", lora=True),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
