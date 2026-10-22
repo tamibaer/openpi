@@ -297,8 +297,7 @@ class LeRobotUR5eDataConfig(DataConfigFactory):
                     {
                         "base_rgb": "image",
                         "wrist_rgb": "wrist_image",
-                        "joints": "joints",
-                        "gripper": "gripper",
+                        "state": "state",  # Datensatz: 6 Gelenke + Greifer in einer Spalte
                         "actions": "actions",
                         "prompt": "prompt",
                     }
@@ -1071,7 +1070,9 @@ _CONFIGS = [
         # Rauchtest lokal (z. B. RTX 5080): winziges Dummy-Modell, keine vortrainierten Gewichte.
         # Prüft nur, ob Datensatz -> Transforms -> Training durchläuft und der Loss sinkt.
         name="ur5e_debug",
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, paligemma_variant="dummy", action_expert_variant="dummy"
+        ),
         data=LeRobotUR5eDataConfig(
             repo_id="local/ur5e_blocks",
             base_config=DataConfig(prompt_from_task=True),
@@ -1087,7 +1088,7 @@ _CONFIGS = [
         # Echtes Fine-Tuning (Cloud-GPU mit >= 24 GB): pi0.5 Base + LoRA.
         name="pi05_ur5e_lora",
         model=pi0_config.Pi0Config(
-            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+            pi05=True, action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ),
         data=LeRobotUR5eDataConfig(
             repo_id="local/ur5e_blocks",
@@ -1096,9 +1097,12 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
         freeze_filter=pi0_config.Pi0Config(
-            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+            pi05=True, action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,
+        # Checkpoints sind groß und der Server-Platz knapp: seltener speichern, wenige behalten.
+        save_interval=2_000,
+        keep_period=10_000,
     ),
     # Paper-Experiment: gleiche Demos, unterschiedliche Sprachvielfalt bzw. Freeze-Strategie.
     _pi0_fast_ur5e("pi0_fast_ur5e_narrow", "local/ur5e_blocks_narrow"),

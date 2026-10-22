@@ -3,8 +3,7 @@
 Datensatz (erzeugt mit examples/ur5e/rosbag_to_lerobot.py):
     image        Basiskamera (D415)
     wrist_image  Handgelenkkamera (D405)
-    joints       6 Gelenkwinkel [rad], Reihenfolge shoulder_pan .. wrist_3
-    gripper      Greifer 0 (offen) .. 1 (geschlossen)
+    state        7 Werte: 6 Gelenkwinkel [rad] (shoulder_pan .. wrist_3) + Greifer 0 (offen) .. 1 (zu)
     actions      7 absolute Zielwerte (6 Gelenke + Greifer)
     task         Sprachanweisung (wird über prompt_from_task zu "prompt")
 
@@ -47,8 +46,12 @@ class UR5eInputs(transforms.DataTransformFn):
     model_type: _model.ModelType = _model.ModelType.PI0
 
     def __call__(self, data: dict) -> dict:
-        # LeRobot gibt Spalten der Form (1,) als Skalar zurück -> atleast_1d.
-        state = np.concatenate([np.asarray(data["joints"]), np.atleast_1d(np.asarray(data["gripper"]))])
+        # Training: Datensatz liefert "state" (7,) = 6 Gelenke + Greifer.
+        # Inference: Roboter-Client schickt "joints" (6,) und "gripper" (1,) getrennt.
+        if "state" in data:
+            state = np.asarray(data["state"])
+        else:
+            state = np.concatenate([np.asarray(data["joints"]), np.atleast_1d(np.asarray(data["gripper"]))])
 
         base_image = _parse_image(data["base_rgb"])
         wrist_image = _parse_image(data["wrist_rgb"])
