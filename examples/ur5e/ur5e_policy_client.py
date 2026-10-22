@@ -32,6 +32,8 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import io
+import pathlib
+import sys
 import threading
 import time
 
@@ -137,6 +139,24 @@ def format_table(current: np.ndarray, targets: np.ndarray, g_now: float, g_targe
     return "\n".join(rows)
 
 
+def import_openpi_client():
+    """openpi_client laden; falls nicht installiert, direkt aus diesem Repo (packages/openpi-client/src)."""
+    try:
+        from openpi_client import websocket_client_policy
+    except ModuleNotFoundError as e:
+        if e.name != "openpi_client":
+            raise SystemExit(f"openpi_client braucht das Paket '{e.name}', das hier fehlt. "
+                             "Siehe Anleitung: eigene Umgebung mit openpi-client anlegen.") from e
+        src = pathlib.Path(__file__).resolve().parents[2] / "packages" / "openpi-client" / "src"
+        sys.path.insert(0, str(src))
+        try:
+            from openpi_client import websocket_client_policy
+        except ModuleNotFoundError as e2:
+            raise SystemExit(f"openpi_client gefunden ({src}), aber das Paket '{e2.name}' fehlt. "
+                             "Siehe Anleitung: eigene Umgebung mit openpi-client anlegen.") from e2
+    return websocket_client_policy
+
+
 # =============================================================================
 # ROS-Node
 # =============================================================================
@@ -152,7 +172,6 @@ def run(args):
     from control_msgs.action import FollowJointTrajectory, GripperCommand
     from sensor_msgs.msg import CompressedImage, Image as RosImage, JointState
     from trajectory_msgs.msg import JointTrajectoryPoint
-    from openpi_client import websocket_client_policy
 
     class PolicyClient(Node):
         def __init__(self):
@@ -264,6 +283,7 @@ def run(args):
             rclpy.shutdown()
         return
 
+    websocket_client_policy = import_openpi_client()
     print(f"Verbinde mit Policy-Server {args.host}:{args.port} ...")
     policy = websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
     print("Verbunden. Prompt:", repr(args.prompt))
@@ -335,7 +355,7 @@ def main():
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--fps", type=float, default=10.0, help="Frequenz des Trainingsdatensatzes")
     p.add_argument("--gripper-open", type=float, default=0.098)
-    p.add_argument("--gripper-closed", type=float, default=0.8)
+    p.add_argument("--gripper-closed", type=float, default=0.79)  # wie rosbag_to_lerobot.py
     p.add_argument("--gripper-effort", type=float, default=20.0)
     p.add_argument("--no-gripper", action="store_true")
     p.add_argument("--exec-steps", type=int, default=3)
