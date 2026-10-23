@@ -10,7 +10,10 @@ Ablauf pro Durchgang:
 Modi:
   --mode dry    nur anzeigen, der Arm bewegt sich NICHT (immer zuerst!)
   --mode step   vor jedem Chunk anzeigen und mit Enter bestätigen
-  --mode auto   läuft selbstständig, bis --max-chunks erreicht ist
+  --mode auto   läuft selbstständig, bis --max-chunks erreicht ist (Arm hält zwischen Chunks kurz an)
+  --mode stream wie auto, aber OHNE Anhalten: der nächste Chunk wird berechnet, während der Arm
+                noch fährt, und nahtlos übergeben. Funktioniert mit jeder Speed-Slider-Stellung.
+                Empfohlen: --slowdown 1 --exec-steps 8
   --mode jointtest  ohne Modell: jedes Gelenk einzeln +0.1 rad und zurück (Anbindung prüfen)
 
 Sicherheitsgrenzen (alle per Kommandozeile änderbar):
@@ -122,6 +125,26 @@ def make_safe_targets(actions: np.ndarray, current: np.ndarray, start: np.ndarra
     return np.array(targets), gripper, clipped
 
 
+def take_chunk(actions: np.ndarray, skip: int, n: int) -> np.ndarray:
+    """Die nächsten n Aktionen ab Index skip (Aktionen, deren Zeitpunkt wegen der Inferenzzeit
+    schon vorbei ist, werden übersprungen). Mindestens die letzte Aktion bleibt übrig."""
+    actions = np.asarray(actions)
+    skip = min(max(skip, 0), len(actions) - 1)
+    return actions[skip : skip + n]
+
+
+def clip_reasons(chunk: np.ndarray, targets: np.ndarray, start: np.ndarray, lim: Limits) -> str:
+    """Welche Gelenke wurden begrenzt und warum: 'Gesamt' = --max-total erreicht, 'Schritt' = --max-step."""
+    names = ["pan", "lift", "elbow", "w1", "w2", "w3"]
+    out = []
+    for i, n in enumerate(names):
+        if np.allclose(chunk[: len(targets), i], targets[:, i], atol=1e-6):
+            continue
+        at_total = np.any(np.abs(targets[:, i] - start[i]) >= lim.max_total - 1e-6)
+        out.append(f"{n}({'Gesamt' if at_total else 'Schritt'})")
+    return ", ".join(out)
+
+
 def gripper_to_raw(g: float, g_open: float, g_closed: float) -> float:
     return g_open + float(np.clip(g, 0.0, 1.0)) * (g_closed - g_open)
 
@@ -198,7 +221,11 @@ def run(args):
             with self.lock:
                 return self.joint_msg, self.images.get("base"), self.images.get("wrist")
 
-    rclpy.init()
+    try:
+        from rclpy.signals import SignalHandlerOptions
+        rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    except (ImportError, TypeError):
+        rclpy.init()
     node = PolicyClient()
     executor = MultiThreadedExecutor()
     executor.add_node(node)
@@ -226,6 +253,29 @@ def run(args):
     jmsg, _, _ = wait_for_data()
     start_q, _, ros_joint_names = read_state(jmsg)
     print("Startpose (rad):", np.round(start_q, 3))
+
+    def make_goal(targets, dt, q_start=None):
+        """Trajektorie aus Gelenkzielen. Mit q_start werden zusätzlich Geschwindigkeiten gesetzt
+        (zentrale Differenzen, letzter Punkt 0) -> der Controller fährt glatte Kurven statt
+        an jedem Punkt abzubremsen, und Übergänge zwischen Chunks bleiben ruckfrei."""
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = ros_joint_names
+        targets = np.asarray(targets, dtype=np.float64)
+        vel = None
+        if q_start is not None:
+            pts = np.vstack([q_start, targets])
+            vel = np.zeros_like(targets)
+            for k in range(len(targets) - 1):
+                vel[k] = (pts[k + 2] - pts[k]) / (2 * dt)
+        for k, tq in enumerate(targets, start=1):
+            p = JointTrajectoryPoint()
+            p.positions = [float(x) for x in tq]
+            if vel is not None:
+                p.velocities = [float(v) for v in vel[k - 1]]
+            t = k * dt
+            p.time_from_start = Duration(sec=int(t), nanosec=int((t % 1) * 1e9))
+            goal.trajectory.points.append(p)
+        return goal
 
     def send_trajectory(targets, dt):
         goal = FollowJointTrajectory.Goal()
@@ -292,6 +342,109 @@ def run(args):
     dt = args.slowdown / args.fps
     last_gripper_sent = None
 
+    def get_obs():
+        jmsg, bmsg, wmsg = wait_for_data()
+        q, g_now, _ = read_state(jmsg)
+        obs = {
+            "base_rgb": resize_with_pad(ros_image_to_rgb(bmsg), args.image_size),
+            "wrist_rgb": resize_with_pad(ros_image_to_rgb(wmsg), args.image_size),
+            "joints": q.astype(np.float32),
+            "gripper": np.array([g_now], dtype=np.float32),
+            "prompt": args.prompt,
+        }
+        return obs, q, g_now
+
+    def send_gripper(g_target):
+        nonlocal last_gripper_sent
+        if args.no_gripper or (last_gripper_sent is not None and abs(g_target - last_gripper_sent) <= 0.1):
+            return
+        gg = GripperCommand.Goal()
+        gg.command.position = gripper_to_raw(g_target, args.gripper_open, args.gripper_closed)
+        gg.command.max_effort = args.gripper_effort
+        node.grip.send_goal_async(gg)
+        last_gripper_sent = g_target
+
+    if args.mode == "stream":
+        # Ablauf: Chunk senden -> warten, bis der Arm (gemessen an seiner IST-Position) fast am Ende
+        # ist -> neues Bild, Modell fragen -> neuen Chunk senden, der den alten nahtlos ersetzt.
+        # Weil der Fortschritt an der Ist-Position gemessen wird statt an der Uhr, passt das auch
+        # bei niedrigem Speed-Slider. Neue Chunks starten bei der Aktion, die der Ist-Position am
+        # nächsten liegt (statt einer geschätzten Zeit), damit nichts vor- oder zurückspringt.
+        print("Kompiliere Modell (erster Aufruf dauert einige Sekunden) ...")
+        obs, _, _ = get_obs()
+        t0 = time.time()
+        policy.infer(obs)
+        print(f"  fertig nach {time.time() - t0:.1f} s")
+        print(f"Stream-Modus: bis zu {args.exec_steps} Aktionen à {dt:.2f} s pro Chunk, Neuplanung ohne Anhalten.")
+
+        latency_est = 0.3
+        goal_fut, result_fut = None, None
+
+        def current_q():
+            j, _, _ = node.snapshot()
+            return read_state(j)[0]
+
+        def goal_finished():
+            nonlocal result_fut
+            if goal_fut is None or not goal_fut.done():
+                return False
+            handle = goal_fut.result()
+            if not handle.accepted:
+                return True
+            if result_fut is None:
+                result_fut = handle.get_result_async()
+            return result_fut.done()
+
+        try:
+            for chunk_no in range(1, args.max_chunks + 1):
+                obs, _, _ = get_obs()
+                t_obs = time.time()
+                actions = np.asarray(policy.infer(obs)["actions"])
+                latency = time.time() - t_obs
+                latency_est = 0.7 * latency_est + 0.3 * latency
+
+                if goal_fut is not None and goal_fut.done() and not goal_fut.result().accepted:
+                    print("Trajektorie vom Controller abgelehnt – Abbruch.")
+                    break
+
+                # Startpunkt im neuen Chunk: Aktion, die der aktuellen Ist-Position am nächsten ist.
+                q_now = current_q()
+                search = actions[: max(1, len(actions) // 2), :6]
+                skip = int(np.argmin(np.linalg.norm(search - q_now, axis=1))) + 1
+                chunk = take_chunk(actions, skip, args.exec_steps)
+                targets, g_target, clipped = make_safe_targets(
+                    chunk, q_now, start_q, Limits(lim.max_step, lim.max_total, len(chunk)))
+
+                goal_fut, result_fut = node.traj.send_goal_async(make_goal(targets, dt, q_start=q_now)), None
+                send_gripper(g_target)
+                why = clip_reasons(np.asarray(chunk, dtype=np.float64), targets, start_q, lim) if clipped else ""
+                print(f"Chunk {chunk_no:3d}: Inferenz {latency * 1000:4.0f} ms, Start bei Aktion {skip}, "
+                      f"führe {len(targets)} aus, Greifer {g_target:.2f}"
+                      f"{'  [BEGRENZT: ' + why + ']' if clipped else ''}")
+
+                # Warten, bis der Arm so weit ist, dass die nächste Antwort rechtzeitig vor dem Ende kommt.
+                lead = int(np.ceil(latency_est / dt)) + 1
+                trigger = max(0, len(targets) - 1 - lead)
+                deadline = time.time() + 20 * len(targets) * dt  # Notbremse, falls der Arm nicht vorankommt
+                while time.time() < deadline:
+                    reached = int(np.argmin(np.linalg.norm(targets - current_q(), axis=1)))
+                    if reached >= trigger or goal_finished():
+                        break
+                    time.sleep(0.01)
+        except KeyboardInterrupt:
+            print("\nAbgebrochen (Strg+C).")
+        finally:
+            # Arm sanft an der aktuellen Position anhalten, dann ROS sauber beenden.
+            try:
+                q_stop = current_q()
+                node.traj.send_goal_async(make_goal([q_stop], 0.5))
+                time.sleep(0.6)
+            except Exception:
+                pass
+            executor.shutdown()
+            rclpy.shutdown()
+        return
+
     try:
         for chunk_no in range(1, args.max_chunks + 1):
             jmsg, bmsg, wmsg = wait_for_data()
@@ -342,7 +495,7 @@ def run(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=["dry", "step", "auto", "jointtest"], default="dry")
+    p.add_argument("--mode", choices=["dry", "step", "auto", "stream", "jointtest"], default="dry")
     p.add_argument("--prompt", default="", help="Sprachanweisung (nicht nötig bei --mode jointtest)")
     p.add_argument("--test-delta", type=float, default=0.1, help="Gelenktest: Auslenkung in rad")
     p.add_argument("--host", default="localhost")
