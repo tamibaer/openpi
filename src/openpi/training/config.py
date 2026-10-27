@@ -1104,6 +1104,28 @@ _CONFIGS = [
         save_interval=2_000,
         keep_period=10_000,
     ),
+    TrainConfig(
+        # Weitertraining: startet von blocks_v1/19999 statt von pi05_base.
+        name="pi05_ur5e_lora_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ),
+        data=LeRobotUR5eDataConfig(
+            repo_id="local/ur5e_vla_all",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "./checkpoints/pi05_ur5e_lora/blocks_v1/19999/params"
+        ),
+        num_train_steps=10_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        save_interval=2_000,
+        keep_period=10_000,
+    ),
+    
     # Paper-Experiment: gleiche Demos, unterschiedliche Sprachvielfalt bzw. Freeze-Strategie.
     _pi0_fast_ur5e("pi0_fast_ur5e_narrow", "local/ur5e_blocks_narrow"),
     _pi0_fast_ur5e("pi0_fast_ur5e_diverse", "local/ur5e_blocks_diverse"),
