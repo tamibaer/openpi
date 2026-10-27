@@ -1105,8 +1105,8 @@ _CONFIGS = [
         keep_period=10_000,
     ),
     TrainConfig(
-        # Weitertraining: startet von blocks_v1/19999 statt von pi05_base.
-        name="pi05_ur5e_lora_v2",
+        # Komplett neu: pi05_base + LoRA auf allen UR5e-Daten (Klötzchen, Erdbeere, Folie).
+        name="pi05_ur5e_lora_all",
         model=pi0_config.Pi0Config(
             pi05=True, action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ),
@@ -1114,10 +1114,8 @@ _CONFIGS = [
             repo_id="local/ur5e_vla_all",
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "./checkpoints/pi05_ur5e_lora/blocks_v1/19999/params"
-        ),
-        num_train_steps=10_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True, action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
