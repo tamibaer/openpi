@@ -1124,10 +1124,8 @@ _CONFIGS = [
         keep_period=10_000,
     ),
     
-    # Paper-Experiment: gleiche Demos, unterschiedliche Sprachvielfalt bzw. Freeze-Strategie.
-    _pi0_fast_ur5e("pi0_fast_ur5e_narrow", "local/ur5e_blocks_narrow"),
-    _pi0_fast_ur5e("pi0_fast_ur5e_diverse", "local/ur5e_blocks_diverse"),
-    _pi0_fast_ur5e("pi0_fast_ur5e_narrow_lora", "local/ur5e_blocks_narrow", lora=True),
+    _pi0_fast_ur5e("pi0_fast_ur5e_meins_lora", "local/mein_datensatz", lora=True),
+    
     # Zero-Shot: Basismodelle ohne Fine-Tuning (UR5e war im Vortraining). Delta- und Absolut-Variante.
     _ur5e_zeroshot("pi0_ur5e_zeroshot", "pi0_base", delta=True),
     _ur5e_zeroshot("pi0_ur5e_zeroshot_abs", "pi0_base", delta=False),
