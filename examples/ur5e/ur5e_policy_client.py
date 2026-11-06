@@ -53,8 +53,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import faulthandler
 import io
+import os
 import pathlib
+import signal
 import sys
 import threading
 import time
@@ -160,6 +163,17 @@ def nearest_action(actions: np.ndarray, q: np.ndarray) -> int:
     return int(np.argmin(np.linalg.norm(search - q, axis=1)))
 
 
+def progress_index(targets: np.ndarray, q: np.ndarray, tol: float = 1e-3) -> int:
+    """Wie weit die Referenz q im Plan ist: letzter Index, dessen Abstand fast minimal ist.
+
+    Ein reines argmin liefert bei gleichen Zielen (Modell sagt "stillstehen", bei pi0-FAST
+    durch die Quantisierung oft exakt gleiche Werte) immer Index 0, der Fortschritt würde nie
+    erkannt. Gleich nahe Ziele zählen deshalb als erreicht.
+    """
+    d = np.linalg.norm(np.asarray(targets) - q, axis=1)
+    return int(np.flatnonzero(d <= d.min() + tol)[-1])
+
+
 def joint_velocities(q_start: np.ndarray, targets: np.ndarray, dt: float, stop_at_end: bool = True) -> np.ndarray:
     """Geschwindigkeiten an den Zielpunkten (zentrale Differenzen über q_start und die Ziele).
 
@@ -255,6 +269,40 @@ def import_openpi_client():
             raise SystemExit(f"openpi_client gefunden ({src}), aber das Paket '{e2.name}' fehlt. "
                              "Siehe Anleitung: eigene Umgebung mit openpi-client anlegen.") from e2
     return websocket_client_policy
+
+
+class PolicyTimeout(RuntimeError):
+    pass
+
+
+def infer_with_timeout(policy, obs, timeout: float) -> dict:
+    """Wie policy.infer(obs), aber mit Timeout statt ewigem Warten.
+
+    Der originale WebsocketClientPolicy.infer() ruft recv() ohne Timeout auf: antwortet der
+    Server nicht (hängt, Speicher voll, Neukompilieren), blockiert der Client stumm für immer.
+    Nach einem Timeout ist die Verbindung nicht mehr synchron (eine späte Antwort würde zur
+    falschen Beobachtung gehören), deshalb wird abgebrochen statt weitergemacht.
+    """
+    from openpi_client import msgpack_numpy
+
+    policy._ws.send(policy._packer.pack(obs))
+    try:
+        response = policy._ws.recv(timeout=timeout)
+    except TimeoutError as e:
+        raise PolicyTimeout(
+            f"Policy-Server hat nach {timeout:g} s nicht geantwortet. Server-Terminal, "
+            "nvidia-smi und htop prüfen.") from e
+    except TypeError as e:  # websockets < 13 kennt recv(timeout=...) nicht
+        raise SystemExit("websockets ist zu alt für recv(timeout=...): pip install 'websockets>=13'") from e
+    if isinstance(response, str):
+        raise RuntimeError(f"Fehler im Policy-Server:\n{response}")
+    return msgpack_numpy.unpackb(response)
+
+
+def server_ms(result: dict) -> str:
+    """Reine Rechenzeit auf dem Server (infer_ms), falls mitgeschickt."""
+    t = result.get("server_timing", {}).get("infer_ms")
+    return f"{t:4.0f} ms" if t is not None else "   ?"
 
 
 def wait_future(fut, timeout: float | None = None):
@@ -421,10 +469,11 @@ class Robot:
 
     def run_trajectory(self, targets, dt, q_start):
         """Trajektorie senden und bis zum Ende warten. False, wenn abgelehnt."""
-        handle = wait_future(self.send_trajectory(targets, dt, q_start))
+        handle = wait_future(self.send_trajectory(targets, dt, q_start), 5.0)
         if handle is None or not handle.accepted:
             return False
-        wait_future(handle.get_result_async())
+        if wait_future(handle.get_result_async(), len(targets) * dt + 10.0) is None:
+            print("Warnung: Trajektorien-Controller meldet kein Ende (Timeout).")
         return True
 
     def hold(self, duration=0.5):
@@ -650,14 +699,17 @@ def run_chunked(robot: Robot, policy, gripper: Gripper, args, start_q):
     for chunk_no in range(1, args.max_chunks + 1):
         obs, q, g_now = robot.observation()
         t0 = time.time()
-        actions = np.asarray(policy.infer(obs)["actions"])
+        timeout = args.compile_timeout if chunk_no == 1 else args.infer_timeout
+        result = infer_with_timeout(policy, obs, timeout)
+        actions = np.asarray(result["actions"])
         latency = time.time() - t0
         q_ref = robot.reference_q() if args.mode != "dry" else q
         chunk = actions[: args.exec_steps]
         targets, clipped = make_safe_targets(chunk, q_ref, start_q, lim)
         g_target = gripper_target(chunk, len(chunk))
 
-        print(f"\n=== Chunk {chunk_no}: Inferenz {latency * 1000:.0f} ms, Modell-Chunk {actions.shape}, "
+        print(f"\n=== Chunk {chunk_no}: Inferenz {latency * 1000:.0f} ms (Server {server_ms(result)}), "
+              f"Modell-Chunk {actions.shape}, "
               f"führe {len(targets)} Aktionen in {len(targets) * dt:.1f} s aus"
               f"{'  [BEGRENZT]' if clipped else ''}")
         print(format_table(q, targets, g_now, g_target))
@@ -694,7 +746,7 @@ def run_stream(robot: Robot, policy, gripper: Gripper, args, start_q):
     print("Kompiliere Modell (erster Aufruf dauert einige Sekunden) ...")
     obs, _, _ = robot.observation()
     t0 = time.time()
-    policy.infer(obs)
+    infer_with_timeout(policy, obs, args.compile_timeout)
     print(f"  fertig nach {time.time() - t0:.1f} s")
     print(f"Stream-Modus: {dt:.2f} s pro Aktion, neu planen nach {args.exec_steps} Aktionen, "
           f"Überblenden über {args.blend_steps} Aktionen.")
@@ -706,7 +758,8 @@ def run_stream(robot: Robot, policy, gripper: Gripper, args, start_q):
     for chunk_no in range(1, args.max_chunks + 1):
         obs, _, _ = robot.observation()
         t_obs = time.time()
-        actions = np.asarray(policy.infer(obs)["actions"])
+        result = infer_with_timeout(policy, obs, args.infer_timeout)
+        actions = np.asarray(result["actions"])
         latency = time.time() - t_obs
         latency_est = 0.7 * latency_est + 0.3 * latency
 
@@ -728,19 +781,23 @@ def run_stream(robot: Robot, policy, gripper: Gripper, args, start_q):
         g_target = gripper_target(chunk, n_exec)
         gripper.command(g_target)
 
-        print(f"Chunk {chunk_no:3d}: Inferenz {latency * 1000:4.0f} ms, Start bei Aktion {skip}, "
+        print(f"Chunk {chunk_no:3d}: Inferenz {latency * 1000:4.0f} ms (Server {server_ms(result)}), "
+              f"Start bei Aktion {skip}, "
               f"{len(targets)} gesendet, neu nach {n_exec}, Greifer {g_target:.2f}"
               f"{'  [BEGRENZT: ' + why + ']' if clipped else ''}")
 
         # Neu planen, sobald die Referenz so weit ist, dass die nächste Antwort vor Aktion n_exec da ist.
         lead = int(np.ceil(latency_est / dt))
         trigger = max(0, n_exec - 1 - lead)
-        deadline = time.time() + 20 * n_exec * dt  # Notbremse, falls der Arm nicht vorankommt
-        while time.time() < deadline:
+        # Notbremse: spätestens nach der 3-fachen Planzeit neu planen (Puffer für den Speed-Slider).
+        deadline = time.time() + max(2.0, 3 * (trigger + 1) * dt)
+        while True:
             if goal_fut.done() and not goal_fut.result().accepted:
                 break
-            reached = int(np.argmin(np.linalg.norm(targets - robot.reference_q(), axis=1)))
-            if reached >= trigger:
+            if progress_index(targets, robot.reference_q()) >= trigger:
+                break
+            if time.time() > deadline:
+                print(f"  Hinweis: Arm kommt nicht voran (Aktion {trigger} nicht erreicht) – plane neu.")
                 break
             time.sleep(0.01)
 
@@ -779,6 +836,8 @@ def run(args):
             run_chunked(robot, policy, gripper, args, start_q)
     except KeyboardInterrupt:
         print("\nAbgebrochen (Strg+C).")
+    except PolicyTimeout as e:
+        print(f"\nABBRUCH: {e}")
     finally:
         if args.mode in ("stream", "auto", "step", "jointtest"):
             try:
@@ -831,7 +890,16 @@ def main():
     p.add_argument("--grasp-hold", type=float, default=0.3, help="nach Ende des Schliessens im Greifprofil bleiben [s]")
     p.add_argument("--grasp-max", type=float, default=3.0, help="spätestens nach dieser Zeit zurück [s]")
     p.add_argument("--admittance-node", default="/admittance_controller")
-    run(p.parse_args())
+    p.add_argument("--infer-timeout", type=float, default=10.0,
+                   help="max. Wartezeit auf eine Antwort des Policy-Servers [s]")
+    p.add_argument("--compile-timeout", type=float, default=300.0,
+                   help="max. Wartezeit beim ersten Aufruf (JAX kompiliert) [s]")
+    args = p.parse_args()
+
+    # Falls doch etwas hängt: `kill -USR1 <PID>` schreibt aus jedem Thread, wo er gerade steht.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    print(f"PID {os.getpid()} – bei Hänger: kill -USR1 {os.getpid()}")
+    run(args)
 
 
 if __name__ == "__main__":
