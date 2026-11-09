@@ -148,19 +148,41 @@ def make_safe_targets(actions: np.ndarray, current: np.ndarray, start: np.ndarra
     return np.array(targets), clipped
 
 
-def gripper_target(actions: np.ndarray, n: int) -> float:
-    """Greiferziel: Wert der n-ten Aktion (Ende des ausgeführten Teils), auf 0..1 begrenzt."""
+def gripper_target(actions: np.ndarray, n: int, threshold: float | None = 0.5) -> float:
+    """Greiferziel: Wert der n-ten Aktion (Ende des ausgeführten Teils), auf 0..1 begrenzt.
+
+    threshold: Im Training ist die Greifer-Aktion binär (0 = offen, 1 = zu). pi0-FAST liefert durch
+    die DCT-Rekonstruktion oft Zwischenwerte (z. B. 0.4), die den Greifer nur halb schliessen.
+    Deshalb wird an der Schwelle auf 0/1 gerundet. None = Rohwert verwenden.
+    """
     actions = np.asarray(actions)
-    return float(np.clip(actions[min(n, len(actions)) - 1, 6], 0.0, 1.0))
+    g = float(np.clip(actions[min(n, len(actions)) - 1, 6], 0.0, 1.0))
+    if threshold is None:
+        return g
+    return 1.0 if g > threshold else 0.0
 
 
-def nearest_action(actions: np.ndarray, q: np.ndarray) -> int:
-    """Index der Aktion in der ersten Chunk-Hälfte, die q am nächsten liegt.
+def nearest_action(actions: np.ndarray, q: np.ndarray, elapsed_steps: int = 0) -> int:
+    """Index der Aktion, die q am nächsten liegt, gesucht in den Aktionen, die schon vorbei sein können.
 
     Aktionen davor sind wegen der Inferenzzeit schon vorbei, der neue Chunk startet danach.
+    Gesucht wird mindestens in der ersten Chunk-Hälfte, bei langer Inferenz (pi0-FAST) entsprechend
+    weiter: elapsed_steps = wie viele Aktionen während der Inferenz vergangen sind.
+    Die letzte Aktion bleibt immer übrig.
     """
-    search = np.asarray(actions)[: max(1, len(actions) // 2), :6]
+    actions = np.asarray(actions)
+    n = max(1, min(len(actions) - 1, max(len(actions) // 2, elapsed_steps + 2)))
+    search = actions[:n, :6]
     return int(np.argmin(np.linalg.norm(search - q, axis=1)))
+
+
+def decode_ok(result: dict) -> bool:
+    """False, wenn der Server meldet, dass das pi0-FAST-Decoding fehlschlug (pi0.5: immer True).
+
+    Ein solcher Chunk ist Unsinn (Gelenke mit festem Offset, Greifer 0.5) und darf nicht
+    ausgeführt werden. Ältere Server ohne dieses Feld gelten als ok.
+    """
+    return bool(result.get("decode_ok", True))
 
 
 def progress_index(targets: np.ndarray, q: np.ndarray, tol: float = 1e-3) -> int:
@@ -703,10 +725,14 @@ def run_chunked(robot: Robot, policy, gripper: Gripper, args, start_q):
         result = infer_with_timeout(policy, obs, timeout)
         actions = np.asarray(result["actions"])
         latency = time.time() - t0
+        if not decode_ok(result):
+            print(f"\n=== Chunk {chunk_no}: Inferenz {latency * 1000:.0f} ms – Decoding fehlgeschlagen, "
+                  "Chunk verworfen, frage neu an.")
+            continue
         q_ref = robot.reference_q() if args.mode != "dry" else q
         chunk = actions[: args.exec_steps]
         targets, clipped = make_safe_targets(chunk, q_ref, start_q, lim)
-        g_target = gripper_target(chunk, len(chunk))
+        g_target = gripper_target(chunk, len(chunk), args.gripper_threshold)
 
         print(f"\n=== Chunk {chunk_no}: Inferenz {latency * 1000:.0f} ms (Server {server_ms(result)}), "
               f"Modell-Chunk {actions.shape}, "
@@ -748,10 +774,21 @@ def run_stream(robot: Robot, policy, gripper: Gripper, args, start_q):
     t0 = time.time()
     infer_with_timeout(policy, obs, args.compile_timeout)
     print(f"  fertig nach {time.time() - t0:.1f} s")
+
+    # Echte Latenz messen (pi0.5 ~0.1–0.2 s, pi0-FAST deutlich mehr), statt sie zu raten.
+    t0 = time.time()
+    result = infer_with_timeout(policy, obs, args.infer_timeout)
+    latency_est = time.time() - t0
+    horizon = len(np.asarray(result["actions"]))
+    lead = int(np.ceil(latency_est / dt))
     print(f"Stream-Modus: {dt:.2f} s pro Aktion, neu planen nach {args.exec_steps} Aktionen, "
           f"Überblenden über {args.blend_steps} Aktionen.")
+    print(f"  Latenz {latency_est * 1000:.0f} ms = {lead} Aktionen, Chunk hat {horizon} Aktionen.")
+    if lead + 1 + args.exec_steps > horizon:
+        print(f"  WARNUNG: Chunk zu kurz für diese Latenz. Während der Inferenz vergehen {lead} Aktionen, "
+              f"danach soll noch {args.exec_steps} ausgeführt werden. Ruckeln möglich: --slowdown erhöhen "
+              f"oder --exec-steps auf höchstens {max(1, horizon - lead - 1)} senken.")
 
-    latency_est = 0.3
     plan: Plan | None = None
     goal_fut = None
 
@@ -767,8 +804,14 @@ def run_stream(robot: Robot, policy, gripper: Gripper, args, start_q):
             print("Trajektorie vom Controller abgelehnt – Abbruch.")
             break
 
+        if not decode_ok(result):
+            # Alten Plan weiterlaufen lassen (er hat noch Puffer) und sofort neu anfragen.
+            print(f"Chunk {chunk_no:3d}: Inferenz {latency * 1000:4.0f} ms – Decoding fehlgeschlagen, "
+                  "Chunk verworfen, frage neu an.")
+            continue
+
         q_ref = robot.reference_q()
-        skip = nearest_action(actions, q_ref) + 1
+        skip = nearest_action(actions, q_ref, int(np.ceil(latency / dt))) + 1
         chunk = actions[min(skip, len(actions) - 1):]
         targets, clipped = make_safe_targets(chunk, q_ref, start_q, lim)
         why = clip_reasons(np.asarray(chunk, dtype=np.float64), targets, start_q, lim) if clipped else ""
@@ -778,7 +821,7 @@ def run_stream(robot: Robot, policy, gripper: Gripper, args, start_q):
         goal_fut = robot.send_trajectory(targets, dt, q_ref)
         plan = Plan(t_send, dt, q_ref, targets)
         n_exec = min(args.exec_steps, len(targets))
-        g_target = gripper_target(chunk, n_exec)
+        g_target = gripper_target(chunk, n_exec, args.gripper_threshold)
         gripper.command(g_target)
 
         print(f"Chunk {chunk_no:3d}: Inferenz {latency * 1000:4.0f} ms (Server {server_ms(result)}), "
@@ -868,6 +911,9 @@ def main():
     p.add_argument("--gripper-closed", type=float, default=0.79)  # wie rosbag_to_lerobot.py
     p.add_argument("--gripper-effort", type=float, default=20.0)
     p.add_argument("--no-gripper", action="store_true")
+    p.add_argument("--gripper-threshold", type=float, default=0.5,
+                   help="Greifer-Aktion an dieser Schwelle auf 0/1 runden (wie im Training binär); "
+                        "negativ = Rohwert senden")
     p.add_argument("--exec-steps", type=int, default=3)
     p.add_argument("--max-step", type=float, default=0.03)
     p.add_argument("--max-total", type=float, default=0.3)
@@ -895,6 +941,8 @@ def main():
     p.add_argument("--compile-timeout", type=float, default=300.0,
                    help="max. Wartezeit beim ersten Aufruf (JAX kompiliert) [s]")
     args = p.parse_args()
+    if args.gripper_threshold < 0:
+        args.gripper_threshold = None
 
     # Falls doch etwas hängt: `kill -USR1 <PID>` schreibt aus jedem Thread, wo er gerade steht.
     faulthandler.register(signal.SIGUSR1, all_threads=True)

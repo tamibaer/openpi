@@ -79,7 +79,26 @@ class UR5eInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class MarkFASTDecodeFailure(transforms.DataTransformFn):
+    """Direkt nach ExtractFASTActions: markiert, ob das FAST-Decoding geklappt hat.
+
+    Schlägt das Decoding fehl, liefert der Tokenizer Nullen im normalisierten Raum. Nach dem
+    Unnormalize sähen die wie eine echte Aktion aus (Gelenke mit festem Offset, Greifer 0.5).
+    Eine gültige Vorhersage ist praktisch nie exakt null (Greifer ist im Training binär = ±1).
+    """
+
+    def __call__(self, data: dict) -> dict:
+        if "actions" not in data:
+            return data
+        return {**data, "decode_ok": bool(np.any(np.asarray(data["actions"]) != 0))}
+
+
+@dataclasses.dataclass(frozen=True)
 class UR5eOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # 6 Gelenke + Greifer; der Rest des Modell-Aktionsvektors ist Padding.
-        return {"actions": np.asarray(data["actions"][..., :7])}
+        # decode_ok: bei pi0.5 immer True, bei pi0-FAST False, wenn das Decoding fehlschlug.
+        return {
+            "actions": np.asarray(data["actions"][..., :7]),
+            "decode_ok": bool(data.get("decode_ok", True)),
+        }

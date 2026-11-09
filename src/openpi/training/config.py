@@ -319,6 +319,12 @@ class LeRobotUR5eDataConfig(DataConfigFactory):
             )
 
         model_transforms = ModelTransformFactory()(model_config)
+        if model_config.model_type == ModelType.PI0_FAST:
+            # Direkt NACH ExtractFASTActions (push() würde davor einfügen) fehlgeschlagene Decodings markieren.
+            model_transforms = _transforms.Group(
+                inputs=model_transforms.inputs,
+                outputs=[*model_transforms.outputs, ur5e_policy.MarkFASTDecodeFailure()],
+            )
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),

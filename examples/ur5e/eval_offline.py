@@ -68,6 +68,7 @@ def main():
         n = len(state)
 
         err_model, err_still, spread, grip_ok, per_joint = [], [], [], [], []
+        n_fail, n_total = 0, 0
         prompt = None
         for i in range(0, n - args.horizon, args.every):
             item = ds[start + i]
@@ -79,8 +80,14 @@ def main():
                 "gripper": state[i, 6:7].astype(np.float32),
                 "prompt": prompt,
             }
-            pred1 = np.asarray(policy.infer(obs)["actions"])[: args.horizon]
-            pred2 = np.asarray(policy.infer(obs)["actions"])[: args.horizon]
+            out1, out2 = policy.infer(obs), policy.infer(obs)
+            n_total += 1
+            # pi0-FAST: fehlgeschlagene Decodings zählen und nicht in die Fehlerwerte mischen.
+            if not (out1.get("decode_ok", True) and out2.get("decode_ok", True)):
+                n_fail += 1
+                continue
+            pred1 = np.asarray(out1["actions"])[: args.horizon]
+            pred2 = np.asarray(out2["actions"])[: args.horizon]
             gt = actions[i : i + args.horizon]
 
             e = np.abs(pred1[:, :6] - gt[:, :6])
@@ -90,6 +97,10 @@ def main():
             spread.append(np.abs(pred1[:, :6] - pred2[:, :6]).mean())
             grip_ok.append(((pred1[:, 6] > 0.5) == (gt[:, 6] > 0.5)).mean())
 
+        if n_fail:
+            print(f"         Decoding fehlgeschlagen: {n_fail}/{n_total} Frames (nicht mitgezählt)")
+        if not err_model:
+            continue
         row = (np.mean(err_model), np.mean(err_still), np.mean(spread), np.mean(grip_ok))
         totals.append(row)
         print(f"{ep:8d} {n:6d} {row[0]:14.4f} {row[1]:11.4f} {row[2]:9.4f} {row[3]:8.0%}  \"{prompt}\"")
