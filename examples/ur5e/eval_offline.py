@@ -17,6 +17,11 @@ Ausgabe pro Episode:
   Streuung        wie stark zwei Vorhersagen für dieselbe Szene voneinander abweichen
   -> große Streuung = Modell ist unsicher (erklärt Hin-und-her-Fahren)
   Greifer         Anteil richtiger auf/zu-Entscheidungen
+
+Robustheitstest (optional): Eingaben leicht stören und den Fehler mit dem ungestörten Lauf vergleichen.
+    --state-noise 0.005   Gauß-Rauschen auf die Gelenkwinkel [rad]
+    --brightness 1.2      Helligkeit beider Kameras (1.0 = unverändert)
+    --image-shift 5       beide Kamerabilder horizontal um N Pixel verschieben
 """
 
 from __future__ import annotations
@@ -37,6 +42,11 @@ def to_hwc_uint8(img) -> np.ndarray:
     return img
 
 
+def perturb_image(img: np.ndarray, brightness: float, shift: int) -> np.ndarray:
+    img = np.clip(img.astype(np.float32) * brightness, 0, 255).astype(np.uint8)
+    return np.roll(img, shift, axis=1) if shift else img
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", default="pi05_ur5e_lora")
@@ -45,6 +55,9 @@ def main():
     p.add_argument("--episodes", type=int, nargs="+", default=[10, 12, 15, 30, 50])
     p.add_argument("--every", type=int, default=20, help="jeden N-ten Frame testen")
     p.add_argument("--horizon", type=int, default=10)
+    p.add_argument("--state-noise", type=float, default=0.0, help="Gauß-Rauschen auf Gelenkwinkel [rad]")
+    p.add_argument("--brightness", type=float, default=1.0, help="Helligkeitsfaktor für beide Kameras")
+    p.add_argument("--image-shift", type=int, default=0, help="horizontale Bildverschiebung in Pixeln")
     args = p.parse_args()
 
     from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
@@ -61,6 +74,7 @@ def main():
     names = ["pan", "lift", "elbow", "w1", "w2", "w3"]
     print(f"\n{'Episode':8s} {'Frames':>6s} {'Modell-Fehler':>14s} {'Stillstand':>11s} {'Streuung':>9s} {'Greifer':>8s}  Prompt")
     totals = []
+    rng = np.random.default_rng(0)  # gleiche Störung für beide Modelle
     for ep in args.episodes:
         t = pq.read_table(files[ep], columns=["state", "actions"]).to_pydict()
         state, actions = np.array(t["state"]), np.array(t["actions"])
@@ -74,9 +88,9 @@ def main():
             item = ds[start + i]
             prompt = item["task"]
             obs = {
-                "base_rgb": to_hwc_uint8(item["image"]),
-                "wrist_rgb": to_hwc_uint8(item["wrist_image"]),
-                "joints": state[i, :6].astype(np.float32),
+                "base_rgb": perturb_image(to_hwc_uint8(item["image"]), args.brightness, args.image_shift),
+                "wrist_rgb": perturb_image(to_hwc_uint8(item["wrist_image"]), args.brightness, args.image_shift),
+                "joints": (state[i, :6] + rng.normal(0, args.state_noise, 6)).astype(np.float32),
                 "gripper": state[i, 6:7].astype(np.float32),
                 "prompt": prompt,
             }
@@ -112,7 +126,7 @@ def main():
     ratio = m[0] / max(m[1], 1e-9)
     print(f"\nModell-Fehler / Stillstand = {ratio:.2f}")
     if ratio < 0.4:
-        print("-> Modell sagt die Demos gut voraus. Problem liegt eher bei der Ausführung am Roboter.")
+        print("-> Modell sagt diese Daten gut voraus. Auf Trainingsdaten sagt das nichts über Generalisierung aus.")
     elif ratio < 0.8:
         print("-> Modell hat etwas gelernt, ist aber ungenau.")
     else:

@@ -859,6 +859,12 @@ def run(args):
         start_q, _ = robot.read_state(jmsg)
         print("Startpose (rad):", np.round(start_q, 3))
 
+        if args.save_obs:
+            obs, _, g = robot.observation()
+            np.savez(args.save_obs, **obs)
+            print(f"Beobachtung gespeichert: {args.save_obs} (Greifer {g:.3f}). Arm wurde nicht bewegt.")
+            return
+
         if args.mode != "dry":
             robot.wait_for_servers()
         if args.mode == "jointtest":
@@ -920,6 +926,7 @@ def main():
     p.add_argument("--slowdown", type=float, default=3.0)
     p.add_argument("--blend-steps", type=int, default=3, help="Stream: Überblenden alter -> neuer Chunk")
     p.add_argument("--max-chunks", type=int, default=20)
+    p.add_argument("--save-obs", default="", help="eine Beobachtung als .npz speichern und beenden, ohne Bewegung")
     p.add_argument("--dry-pause", type=float, default=1.0, help="Pause zwischen Chunks im dry-Modus [s]")
     p.add_argument("--grasp-z-stiffness", type=float, default=12.0,
                    help="z-Steifigkeit der Admittanz beim Schliessen [N/m], 0 = weiches Greifen aus")

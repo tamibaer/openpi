@@ -56,20 +56,29 @@ class UR5eInputs(transforms.DataTransformFn):
         base_image = _parse_image(data["base_rgb"])
         wrist_image = _parse_image(data["wrist_rgb"])
 
-        inputs = {
-            "state": state,
-            "image": {
+        if self.model_type == _model.ModelType.PI0_FAST:
+            # FAST-Konvention wie im Vortraining (siehe droid_policy): Leeres Bild an zweiter Stelle,
+            # Handgelenk an dritter, keine Maskierung.
+            image = {
+                "base_0_rgb": base_image,
+                "base_1_rgb": np.zeros_like(base_image),
+                "wrist_0_rgb": wrist_image,
+            }
+            image_mask = {key: np.True_ for key in image}
+        else:
+            # Kein rechtes Handgelenk -> leeres Bild, Maske aus.
+            image = {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,
-                # Kein rechtes Handgelenk -> leeres Bild, Maske aus (außer bei pi0-FAST).
                 "right_wrist_0_rgb": np.zeros_like(base_image),
-            },
-            "image_mask": {
+            }
+            image_mask = {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
-                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
-            },
-        }
+                "right_wrist_0_rgb": np.False_,
+            }
+
+        inputs = {"state": state, "image": image, "image_mask": image_mask}
 
         if "actions" in data:
             inputs["actions"] = data["actions"]
