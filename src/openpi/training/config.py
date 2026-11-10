@@ -1131,6 +1131,7 @@ _CONFIGS = [
     ),
     
     _pi0_fast_ur5e("pi0_fast_ur5e_lora_test_1", "local/ur5e_blocks", lora=True),
+    _pi0_fast_ur5e("pi0_fast_ur5e_full", "local/ur5e_blocks", lora=False),
 
     # Zero-Shot: Basismodelle ohne Fine-Tuning (UR5e war im Vortraining). Delta- und Absolut-Variante.
     _ur5e_zeroshot("pi0_ur5e_zeroshot", "pi0_base", delta=True),
