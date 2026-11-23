@@ -122,7 +122,7 @@ def main():
         dst = LeRobotDataset(args.repo_id, root=root)
         print(f"Lade hoch nach https://huggingface.co/datasets/{args.repo_id} "
               f"({'öffentlich' if args.public else 'privat'}) ...")
-        dst.push_to_hub(private=not args.public, tags=["ur5e", "openpi"], upload_large_folder=True)
+        dst.push_to_hub(private=not args.public, tags=["ur5e", "openpi"], upload_large_folder=False)  # ein einziger Commit; viele parallele Anfragen lösen 429 aus
         print("Hochgeladen.")
 
 
